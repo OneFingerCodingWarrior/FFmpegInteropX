@@ -21,6 +21,10 @@
 #include "FFmpegInteropConfig.h"
 #include "AvEffectDefinition.h"
 #include "TimeSpanHelpers.h"
+#include "Enumerations.h"
+#include "StreamInfo.h"
+#include <d3d11.h>
+
 
 extern "C"
 {
@@ -30,6 +34,7 @@ extern "C"
 using namespace Windows::Storage::Streams;
 using namespace Windows::Media::Core;
 using namespace Windows::Media::MediaProperties;
+using namespace Windows::Graphics::DirectX::Direct3D11;
 
 namespace FFmpegInterop
 {
@@ -47,6 +52,26 @@ namespace FFmpegInterop
 			IMediaStreamDescriptor^ get() { return m_streamDescriptor; }
 		}
 
+		property IStreamInfo^ StreamInfo
+		{
+			IStreamInfo^ get() { return streamInfo; }
+		}
+
+		property AudioStreamInfo^ AudioInfo
+		{
+			AudioStreamInfo^ get() { return dynamic_cast<AudioStreamInfo^>(streamInfo); }
+		}
+
+		property VideoStreamInfo^ VideoInfo
+		{
+			VideoStreamInfo^ get() { return dynamic_cast<VideoStreamInfo^>(streamInfo); }
+		}
+
+		property SubtitleStreamInfo^ SubtitleInfo
+		{
+			SubtitleStreamInfo^ get() { return dynamic_cast<SubtitleStreamInfo^>(streamInfo); }
+		}
+
 		property int StreamIndex
 		{
 			int get() { return m_streamIndex; }
@@ -57,19 +82,31 @@ namespace FFmpegInterop
 			bool get() { return m_isEnabled; }
 		}
 
+		property HardwareDecoderStatus HardwareAccelerationStatus
+		{
+			HardwareDecoderStatus get() { return hardwareDecoderStatus; }
+		}
+
+		property DecoderEngine Decoder
+		{
+			DecoderEngine get() { return decoder; }
+		}
+
 		property bool IsCleanSample;
 
 		property String^ Name;
 		property String^ Language;
 		property String^ CodecName;
 
+
 	internal:
 		virtual HRESULT Initialize();
 		void InitializeNameLanguageCodec();
+		virtual void InitializeStreamInfo();
 		virtual void QueuePacket(AVPacket *packet);
 		AVPacket* PopPacket();
 		HRESULT GetNextPacket(AVPacket** avPacket, LONGLONG & packetPts, LONGLONG & packetDuration);
-		virtual HRESULT CreateNextSampleBuffer(IBuffer^* pBuffer, int64_t& samplePts, int64_t& sampleDuration) = 0;
+		virtual HRESULT CreateNextSampleBuffer(IBuffer^* pBuffer, int64_t& samplePts, int64_t& sampleDuration, IDirect3DSurface^* surface) = 0;
 		virtual IMediaStreamDescriptor^ CreateStreamDescriptor() = 0;
 		virtual HRESULT SetSampleProperties(MediaStreamSample^ sample) { return S_OK; }; // can be overridded for setting extended properties
 		void EnableStream();
@@ -78,6 +115,7 @@ namespace FFmpegInterop
 		virtual void DisableFilters() {};//override for disabling filters in sample providers;
 		virtual void SetCommonVideoEncodingProperties(VideoEncodingProperties^ videoEncodingProperties, bool isCompressedFormat);
 		virtual void Detach();
+		void SetHardwareDevice(ID3D11Device* device, ID3D11DeviceContext* context);
 
 	protected private:
 		MediaSampleProvider(
@@ -85,12 +123,14 @@ namespace FFmpegInterop
 			AVFormatContext* avFormatCtx,
 			AVCodecContext* avCodecCtx,
 			FFmpegInteropConfig^ config,
-			int streamIndex);
+			int streamIndex,
+			HardwareDecoderStatus hardwareDecoderStatus);
 
 	private:
 		std::queue<AVPacket*> m_packetQueue;
 		int64 m_nextPacketPts;
 		IMediaStreamDescriptor^ m_streamDescriptor;
+		HardwareDecoderStatus hardwareDecoderStatus;
 
 	internal:
 		// The FFmpeg context. Because they are complex types
@@ -101,11 +141,14 @@ namespace FFmpegInterop
 		AVFormatContext* m_pAvFormatCtx;
 		AVCodecContext* m_pAvCodecCtx;
 		AVStream* m_pAvStream;
+		IStreamInfo^ streamInfo;
 		bool m_isEnabled = false;
 		bool m_isDiscontinuous;
 		int m_streamIndex;
 		int64 m_startOffset;
-
+		DecoderEngine decoder;
+		ID3D11Device* device;
+		ID3D11DeviceContext* deviceContext;
 	};
 }
 

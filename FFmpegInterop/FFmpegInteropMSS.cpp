@@ -24,6 +24,7 @@
 #include "HEVCSampleProvider.h"
 #include "UncompressedAudioSampleProvider.h"
 #include "UncompressedVideoSampleProvider.h"
+#include "D3D11VideoSampleProvider.h"
 #include "SubtitleProviderSsaAss.h"
 #include "SubtitleProviderBitmap.h"
 #include "CritSec.h"
@@ -34,11 +35,13 @@
 #include "FFmpegVersionInfo.h"
 #include "collection.h"
 #include <ppl.h>
+#include <Mfidl.h>
 
 extern "C"
 {
 #include <libavutil/imgutils.h>
 #include <libavutil/opt.h>
+#include <libavutil/hwcontext_d3d11va.h>
 }
 
 using namespace concurrency;
@@ -82,6 +85,8 @@ FFmpegInteropMSS::FFmpegInteropMSS(FFmpegInteropConfig^ interopConfig, CoreDispa
 	subtitleDelay = config->DefaultSubtitleDelay;
 	audioStrInfos = ref new Vector<AudioStreamInfo^>();
 	subtitleStrInfos = ref new Vector<SubtitleStreamInfo^>();
+	videoStrInfos = ref new Vector<VideoStreamInfo^>();
+
 	if (!config->IsExternalSubtitleParser && !config->IsFrameGrabber)
 	{
 		metadata = ref new MediaMetadata();
@@ -108,15 +113,17 @@ FFmpegInteropMSS::~FFmpegInteropMSS()
 
 	// Clear our data
 	currentAudioStream = nullptr;
-	videoStream = nullptr;
+	currentVideoStream = nullptr;
 
 	if (m_pReader != nullptr)
 	{
 		m_pReader = nullptr;
 	}
 
+	subtitleStreams.clear();
 	sampleProviders.clear();
 	audioStreams.clear();
+	videoStreams.clear();
 
 	avformat_close_input(&avFormatCtx);
 	av_free(avIOCtx);
@@ -126,6 +133,16 @@ FFmpegInteropMSS::~FFmpegInteropMSS()
 	{
 		fileStreamData->Release();
 	}
+	if (avHardwareContext)
+	{
+		av_buffer_unref(&avHardwareContext);
+	}
+	if (avHardwareContextDefault)
+	{
+		av_buffer_unref(&avHardwareContextDefault);
+	}
+	SAFE_RELEASE(device);
+	SAFE_RELEASE(deviceContext);
 	mutexGuard.unlock();
 }
 
@@ -133,18 +150,18 @@ IAsyncOperation<FFmpegInteropMSS^>^ FFmpegInteropMSS::CreateFromStreamAsync(IRan
 {
 	auto dispatcher = GetCurrentDispatcher();
 	return create_async([stream, config, dispatcher]
-	{
-		return CreateFromStream(stream, config, nullptr, dispatcher);
-	});
+		{
+			return CreateFromStream(stream, config, nullptr, dispatcher);
+		});
 };
 
 IAsyncOperation<FFmpegInteropMSS^>^ FFmpegInteropMSS::CreateFromUriAsync(String^ uri, FFmpegInteropConfig^ config)
 {
 	auto dispatcher = GetCurrentDispatcher();
 	return create_async([uri, config, dispatcher]
-	{
-		return CreateFromUri(uri, config, dispatcher);
-	});
+		{
+			return CreateFromUri(uri, config, dispatcher);
+		});
 };
 
 FFmpegInteropMSS^ FFmpegInteropMSS::CreateFromStream(IRandomAccessStream^ stream, FFmpegInteropConfig^ config, MediaStreamSource^ mss, CoreDispatcher^ dispatcher)
@@ -171,16 +188,18 @@ FFmpegInteropMSS^ FFmpegInteropMSS::CreateFromUri(String^ uri, FFmpegInteropConf
 
 FFmpegInteropMSS^ FFmpegInteropMSS::CreateFFmpegInteropMSSFromStream(IRandomAccessStream^ stream, bool forceAudioDecode, bool forceVideoDecode, PropertySet^ ffmpegOptions, MediaStreamSource^ mss)
 {
+#pragma warning (disable: 4973)
 	auto config = ref new FFmpegInteropConfig();
 	config->PassthroughAudioAAC = !forceAudioDecode;
 	config->PassthroughAudioMP3 = !forceAudioDecode;
 	config->PassthroughVideoH264 = !forceVideoDecode;
-	config->PassthroughVideoH264Hi10P = !forceVideoDecode;
 	config->PassthroughVideoHEVC = !forceVideoDecode;
 	config->PassthroughVideoMPEG2 = !forceVideoDecode;
 	config->PassthroughVideoVC1 = !forceVideoDecode;
 	config->PassthroughVideoVP9 = !forceVideoDecode;
 	config->PassthroughVideoWMV3 = !forceVideoDecode;
+#pragma warning (default: 4973)
+
 	if (ffmpegOptions != nullptr)
 	{
 		config->FFmpegOptions = ffmpegOptions;
@@ -210,16 +229,18 @@ FFmpegInteropMSS^ FFmpegInteropMSS::CreateFFmpegInteropMSSFromStream(IRandomAcce
 
 FFmpegInteropMSS^ FFmpegInteropMSS::CreateFFmpegInteropMSSFromUri(String^ uri, bool forceAudioDecode, bool forceVideoDecode, PropertySet^ ffmpegOptions)
 {
+#pragma warning (disable: 4973)
 	auto config = ref new FFmpegInteropConfig();
 	config->PassthroughAudioAAC = !forceAudioDecode;
 	config->PassthroughAudioMP3 = !forceAudioDecode;
 	config->PassthroughVideoH264 = !forceVideoDecode;
-	config->PassthroughVideoH264Hi10P = !forceVideoDecode;
 	config->PassthroughVideoHEVC = !forceVideoDecode;
 	config->PassthroughVideoMPEG2 = !forceVideoDecode;
 	config->PassthroughVideoVC1 = !forceVideoDecode;
 	config->PassthroughVideoVP9 = !forceVideoDecode;
 	config->PassthroughVideoWMV3 = !forceVideoDecode;
+#pragma warning (default: 4973)
+
 	if (ffmpegOptions != nullptr)
 	{
 		config->FFmpegOptions = ffmpegOptions;
@@ -255,12 +276,27 @@ MediaSource^ FFmpegInteropMSS::CreateMediaSource()
 	{
 		source->ExternalTimedMetadataTracks->Append(stream->SubtitleTrack);
 	}
-	for each(auto subtitleInfo in SubtitleStreams)
+	for each (auto subtitleInfo in SubtitleStreams)
 	{
 		if (subtitleInfo->IsExternal) {
 			source->ExternalTimedMetadataTracks->Append(subtitleInfo->SubtitleTrack);
 		}
 	}
+
+	if (chapterInfos->Size > 0)
+	{
+		auto track = ref new TimedMetadataTrack("Chapters", "", TimedMetadataKind::Chapter);
+		for each (auto chapter in chapterInfos)
+		{
+			auto cue = ref new ChapterCue();
+			cue->Title = chapter->Title;
+			cue->StartTime = chapter->StartTime;
+			cue->Duration = chapter->Duration;
+			track->AddCue(cue);
+		}
+		source->ExternalTimedMetadataTracks->Append(track);
+	}
+
 	return source;
 }
 
@@ -318,109 +354,112 @@ MediaPlaybackItem^ FFmpegInteropMSS::CreateMediaPlaybackItem(TimeSpan startTime,
 	}
 }
 
-IAsyncOperation<IVectorView<SubtitleStreamInfo^>^>^ FFmpegInteropMSS::AddExternalSubtitleAsync(IRandomAccessStream ^ stream, String^ streamName)
+IAsyncOperation<IVectorView<SubtitleStreamInfo^>^>^ FFmpegInteropMSS::AddExternalSubtitleAsync(IRandomAccessStream^ stream, String^ streamName)
 {
 	return create_async([this, stream, streamName]
-	{
-		auto subConfig = ref new FFmpegInteropConfig();
-		subConfig->IsExternalSubtitleParser = true;
-		subConfig->DefaultSubtitleStreamName = streamName;
-		subConfig->DefaultSubtitleDelay = this->SubtitleDelay;
-		subConfig->AutoCorrectAnsiSubtitles = this->config->AutoCorrectAnsiSubtitles;
-		subConfig->AnsiSubtitleEncoding = this->config->AnsiSubtitleEncoding;
-		subConfig->OverrideSubtitleStyles = this->config->OverrideSubtitleStyles;
-		subConfig->SubtitleRegion = this->config->SubtitleRegion;
-		subConfig->SubtitleStyle = this->config->SubtitleStyle;
-		subConfig->AutoCorrectAnsiSubtitles = this->config->AutoCorrectAnsiSubtitles;
-		subConfig->AutoSelectForcedSubtitles = false;
-
-		if (VideoDescriptor)
 		{
-			subConfig->AdditionalFFmpegSubtitleOptions = ref new PropertySet();
+			auto subConfig = ref new FFmpegInteropConfig();
+			subConfig->IsExternalSubtitleParser = true;
+			subConfig->DefaultSubtitleStreamName = streamName;
+			subConfig->DefaultSubtitleDelay = this->SubtitleDelay;
+			subConfig->AutoCorrectAnsiSubtitles = this->config->AutoCorrectAnsiSubtitles;
+			subConfig->AnsiSubtitleEncoding = this->config->AnsiSubtitleEncoding;
+			subConfig->OverrideSubtitleStyles = this->config->OverrideSubtitleStyles;
+			subConfig->SubtitleRegion = this->config->SubtitleRegion;
+			subConfig->SubtitleStyle = this->config->SubtitleStyle;
+			subConfig->AutoCorrectAnsiSubtitles = this->config->AutoCorrectAnsiSubtitles;
+			subConfig->AutoSelectForcedSubtitles = false;
+			subConfig->MinimumSubtitleDuration = this->config->MinimumSubtitleDuration;
+			subConfig->AdditionalSubtitleDuration = this->config->AdditionalSubtitleDuration;
+			subConfig->PreventModifiedSubtitleDurationOverlap = this->config->PreventModifiedSubtitleDurationOverlap;
 
-			subConfig->AdditionalFFmpegSubtitleOptions->Insert("subfps",
-				VideoDescriptor->EncodingProperties->FrameRate->Numerator.ToString() + "/" + VideoDescriptor->EncodingProperties->FrameRate->Denominator.ToString());
-		}
-		auto externalSubsParser = FFmpegInteropMSS::CreateFromStream(stream, subConfig, nullptr, nullptr);
-
-		if (externalSubsParser->SubtitleStreams->Size > 0)
-		{
 			if (VideoDescriptor)
 			{
-				auto pixelAspect = (double)VideoDescriptor->EncodingProperties->PixelAspectRatio->Numerator / VideoDescriptor->EncodingProperties->PixelAspectRatio->Denominator;
-				auto videoAspect = ((double)videoStream->m_pAvCodecCtx->width / videoStream->m_pAvCodecCtx->height) / pixelAspect;
-				for each (auto stream in externalSubsParser->subtitleStreams)
+				subConfig->AdditionalFFmpegSubtitleOptions = ref new PropertySet();
+
+				subConfig->AdditionalFFmpegSubtitleOptions->Insert("subfps",
+					VideoDescriptor->EncodingProperties->FrameRate->Numerator.ToString() + "/" + VideoDescriptor->EncodingProperties->FrameRate->Denominator.ToString());
+			}
+			auto externalSubsParser = FFmpegInteropMSS::CreateFromStream(stream, subConfig, nullptr, nullptr);
+
+			if (externalSubsParser->SubtitleStreams->Size > 0)
+			{
+				if (VideoDescriptor)
 				{
-					stream->NotifyVideoFrameSize(videoStream->m_pAvCodecCtx->width, videoStream->m_pAvCodecCtx->height, videoAspect);
+					auto pixelAspect = (double)VideoDescriptor->EncodingProperties->PixelAspectRatio->Numerator / VideoDescriptor->EncodingProperties->PixelAspectRatio->Denominator;
+					auto videoAspect = ((double)currentVideoStream->m_pAvCodecCtx->width / currentVideoStream->m_pAvCodecCtx->height) / pixelAspect;
+					for each (auto stream in externalSubsParser->subtitleStreams)
+					{
+						stream->NotifyVideoFrameSize(currentVideoStream->m_pAvCodecCtx->width, currentVideoStream->m_pAvCodecCtx->height, videoAspect);
+					}
+				}
+
+				int readResult = 0;
+				while ((readResult = externalSubsParser->m_pReader->ReadPacket()) >= 0)
+				{
+					Concurrency::interruption_point();
 				}
 			}
 
-			int readResult = 0;
-			while ((readResult = externalSubsParser->m_pReader->ReadPacket()) >= 0)
+
+			mutexGuard.lock();
+			try
 			{
-				Concurrency::interruption_point();
-			}
-		}
-
-
-		mutexGuard.lock();
-		try
-		{
-			if (SubtitleDelay.Duration != externalSubsParser->SubtitleDelay.Duration)
-			{
-				externalSubsParser->SetSubtitleDelay(SubtitleDelay);
-			}
-
-			int subtitleTracksCount = 0;
-
-			for each(auto externalSubtitle in externalSubsParser->subtitleStreams)
-			{
-				if (externalSubtitle->SubtitleTrack->Cues->Size > 0)
+				if (SubtitleDelay.Duration != externalSubsParser->SubtitleDelay.Duration)
 				{
-					// detach stream
-					externalSubtitle->Detach();
+					externalSubsParser->SetSubtitleDelay(SubtitleDelay);
+				}
 
-					// find and add stream info
-					for each (auto subtitleInfo in externalSubsParser->SubtitleStreams)
+				int subtitleTracksCount = 0;
+
+				for each (auto externalSubtitle in externalSubsParser->subtitleStreams)
+				{
+					if (externalSubtitle->SubtitleTrack->Cues->Size > 0)
 					{
-						if (subtitleInfo->SubtitleTrack == externalSubtitle->SubtitleTrack)
+						// detach stream
+						externalSubtitle->Detach();
+
+						// find and add stream info
+						for each (auto subtitleInfo in externalSubsParser->SubtitleStreams)
 						{
-							subtitleStrInfos->Append(subtitleInfo);
-							break;
+							if (subtitleInfo->SubtitleTrack == externalSubtitle->SubtitleTrack)
+							{
+								subtitleStrInfos->Append(subtitleInfo);
+								break;
+							}
 						}
-					}
 
-					// add stream
-					subtitleStreams.push_back(externalSubtitle);
-					if (this->PlaybackItem != nullptr)
-					{
-						PlaybackItem->Source->ExternalTimedMetadataTracks->Append(externalSubtitle->SubtitleTrack);
+						// add stream
+						subtitleStreams.push_back(externalSubtitle);
+						if (this->PlaybackItem != nullptr)
+						{
+							PlaybackItem->Source->ExternalTimedMetadataTracks->Append(externalSubtitle->SubtitleTrack);
+						}
+						subtitleTracksCount++;
 					}
-					subtitleTracksCount++;
 				}
-			}
 
-			if (subtitleTracksCount == 0)
+				if (subtitleTracksCount == 0)
+				{
+					throw ref new InvalidArgumentException("No subtitles found in file.");
+				}
+
+				subtitleStreamInfos = subtitleStrInfos->GetView();
+			}
+			catch (...)
 			{
-				throw ref new InvalidArgumentException("No subtitles found in file.");
+				mutexGuard.unlock();
+				throw;
 			}
-
-			subtitleStreamInfos = subtitleStrInfos->GetView();
-		}
-		catch (...)
-		{
 			mutexGuard.unlock();
-			throw;
-		}
-		mutexGuard.unlock();
-		return externalSubsParser->SubtitleStreams;
-	});
+			return externalSubsParser->SubtitleStreams;
+		});
 }
 
 void FFmpegInteropMSS::InitializePlaybackItem(MediaPlaybackItem^ playbackitem)
 {
-	audioTracksChangedToken = playbackitem->AudioTracksChanged += ref new Windows::Foundation::TypedEventHandler<Windows::Media::Playback::MediaPlaybackItem ^, Windows::Foundation::Collections::IVectorChangedEventArgs ^>(this, &FFmpegInterop::FFmpegInteropMSS::OnAudioTracksChanged);
-	subtitlePresentationModeChangedToken = playbackitem->TimedMetadataTracks->PresentationModeChanged += ref new Windows::Foundation::TypedEventHandler<Windows::Media::Playback::MediaPlaybackTimedMetadataTrackList ^, Windows::Media::Playback::TimedMetadataPresentationModeChangedEventArgs ^>(this, &FFmpegInterop::FFmpegInteropMSS::OnPresentationModeChanged);
+	audioTracksChangedToken = playbackitem->AudioTracksChanged += ref new Windows::Foundation::TypedEventHandler<Windows::Media::Playback::MediaPlaybackItem^, Windows::Foundation::Collections::IVectorChangedEventArgs^>(this, &FFmpegInterop::FFmpegInteropMSS::OnAudioTracksChanged);
+	subtitlePresentationModeChangedToken = playbackitem->TimedMetadataTracks->PresentationModeChanged += ref new Windows::Foundation::TypedEventHandler<Windows::Media::Playback::MediaPlaybackTimedMetadataTrackList^, Windows::Media::Playback::TimedMetadataPresentationModeChangedEventArgs^>(this, &FFmpegInterop::FFmpegInteropMSS::OnPresentationModeChanged);
 
 	if (config->AutoSelectForcedSubtitles)
 	{
@@ -443,7 +482,65 @@ void FFmpegInteropMSS::InitializePlaybackItem(MediaPlaybackItem^ playbackitem)
 	}
 }
 
-void FFmpegInteropMSS::OnPresentationModeChanged(MediaPlaybackTimedMetadataTrackList ^sender, TimedMetadataPresentationModeChangedEventArgs ^args)
+bool FFmpegInteropMSS::CheckUseHardwareAcceleration(AVCodecContext* avCodecCtx, HardwareAccelerationStatus^ status, HardwareDecoderStatus& hardwareDecoderStatus, bool manualStatus, int maxProfile, int maxLevel)
+{
+	bool result = false;
+	if (!config->IsFrameGrabber)
+	{
+#pragma warning (disable: 4973)
+
+		if (config->VideoDecoderMode == VideoDecoderMode::AutoDetection || config->VideoDecoderMode == VideoDecoderMode::AutomaticSystemDecoder)
+		{
+			result = CodecChecker::CheckUseHardwareAcceleration(status,
+				avCodecCtx->codec_id, avCodecCtx->profile, avCodecCtx->width, avCodecCtx->height);
+
+			// check level, if restricted
+			if (result && maxLevel >= 0)
+			{
+				result = avCodecCtx->level <= maxLevel;
+			}
+
+			hardwareDecoderStatus = result ? HardwareDecoderStatus::Available : HardwareDecoderStatus::NotAvailable;
+		}
+		else if (config->VideoDecoderMode == VideoDecoderMode::ManualSelection)
+		{
+			// manual settings
+			if (manualStatus)
+			{
+				// check profile, if restricted
+				if (maxProfile >= 0)
+				{
+					result = avCodecCtx->profile <= maxProfile;
+				}
+				else
+				{
+					result = true;
+				}
+
+				// check level, if restricted
+				if (result && maxLevel >= 0)
+				{
+					result = avCodecCtx->level <= maxLevel;
+				}
+			}
+		}
+		else if (config->VideoDecoderMode == VideoDecoderMode::ForceSystemDecoder)
+		{
+			result = true;
+		}
+		else
+		{
+			result = false;
+		}
+#pragma warning (default: 4973)
+
+	}
+
+	return result;
+}
+
+
+void FFmpegInteropMSS::OnPresentationModeChanged(MediaPlaybackTimedMetadataTrackList^ sender, TimedMetadataPresentationModeChangedEventArgs^ args)
 {
 	mutexGuard.lock();
 	int index = 0;
@@ -466,7 +563,7 @@ void FFmpegInteropMSS::OnPresentationModeChanged(MediaPlaybackTimedMetadataTrack
 	mutexGuard.unlock();
 }
 
-void FFmpegInteropMSS::OnAudioTracksChanged(MediaPlaybackItem ^sender, IVectorChangedEventArgs ^args)
+void FFmpegInteropMSS::OnAudioTracksChanged(MediaPlaybackItem^ sender, IVectorChangedEventArgs^ args)
 {
 	mutexGuard.lock();
 	if (sender->AudioTracks->Size == AudioStreams->Size)
@@ -491,7 +588,6 @@ void FFmpegInteropMSS::OnAudioTracksChanged(MediaPlaybackItem ^sender, IVectorCh
 HRESULT FFmpegInteropMSS::CreateMediaStreamSource(String^ uri)
 {
 	HRESULT hr = S_OK;
-	const char* charStr = nullptr;
 	if (!uri)
 	{
 		hr = E_INVALIDARG;
@@ -514,12 +610,10 @@ HRESULT FFmpegInteropMSS::CreateMediaStreamSource(String^ uri)
 
 	if (SUCCEEDED(hr))
 	{
-		std::wstring uriW(uri->Begin());
-		std::string uriA(uriW.begin(), uriW.end());
-		charStr = uriA.c_str();
+		auto charStr = StringUtils::PlatformStringToUtf8String(uri);
 
 		// Open media in the given URI using the specified options
-		if (avformat_open_input(&avFormatCtx, charStr, NULL, &avDict) < 0)
+		if (avformat_open_input(&avFormatCtx, charStr.c_str(), NULL, &avDict) < 0)
 		{
 			hr = E_FAIL; // Error opening file
 		}
@@ -631,30 +725,50 @@ HRESULT FFmpegInteropMSS::CreateMediaStreamSource(IRandomAccessStream^ stream, M
 
 static int is_hwaccel_pix_fmt(enum AVPixelFormat pix_fmt)
 {
-	const AVPixFmtDescriptor *desc = av_pix_fmt_desc_get(pix_fmt);
+	const AVPixFmtDescriptor* desc = av_pix_fmt_desc_get(pix_fmt);
 	return desc->flags & AV_PIX_FMT_FLAG_HWACCEL;
 }
 
-static AVPixelFormat get_format(struct AVCodecContext *s, const enum AVPixelFormat *fmt)
+static AVPixelFormat get_format(struct AVCodecContext* s, const enum AVPixelFormat* fmt)
 {
-	AVPixelFormat result = (AVPixelFormat)-1;
+	AVPixelFormat result_sw = (AVPixelFormat)-1;
+	AVPixelFormat result_hw = (AVPixelFormat)-1;
 	AVPixelFormat format;
 	int index = 0;
 	do
 	{
 		format = fmt[index++];
-		if (format != -1 && result == -1 && !is_hwaccel_pix_fmt(format))
+
+		//		
+		if (format != -1)
 		{
-			// take first non hw accelerated format
-			result = format;
-		}
-		else if (format == AV_PIX_FMT_NV12 && result != AV_PIX_FMT_YUVA420P)
-		{
-			// switch to NV12 if available, unless this is an alpha channel file
-			result = format;
+			if (s->hw_device_ctx && format == AV_PIX_FMT_D3D11)
+			{
+				// we only support D3D11 HW format (not D3D11_VLD)
+				result_hw = format;
+			}
+			else if (result_sw == -1 && !is_hwaccel_pix_fmt(format))
+			{
+				// take first non hw accelerated format
+				result_sw = format;
+			}
+			else if (format == AV_PIX_FMT_NV12 && result_sw != AV_PIX_FMT_YUVA420P)
+			{
+				// switch SW format to NV12 if available, unless this is an alpha channel file
+				result_sw = format;
+			}
 		}
 	} while (format != -1);
-	return result;
+
+
+	if (result_hw != -1)
+	{
+		return result_hw;
+	}
+	else
+	{
+		return result_sw;
+	}
 }
 
 HRESULT FFmpegInteropMSS::InitFFmpegContext()
@@ -716,6 +830,8 @@ HRESULT FFmpegInteropMSS::InitFFmpegContext()
 	for (unsigned int index = 0; index < avFormatCtx->nb_streams; index++)
 	{
 		auto avStream = avFormatCtx->streams[index];
+		avStream->discard = AVDISCARD_ALL; // all streams are disabled until we enable them
+
 		MediaSampleProvider^ stream;
 
 		if (avStream->codecpar->codec_type == AVMEDIA_TYPE_AUDIO && !config->IsFrameGrabber && !config->IsExternalSubtitleParser)
@@ -723,26 +839,16 @@ HRESULT FFmpegInteropMSS::InitFFmpegContext()
 			stream = CreateAudioStream(avStream, index);
 			if (stream)
 			{
-				bool isDefault = index == audioStreamIndex;
-
-				// TODO get info from sample provider
-				auto channels = avStream->codecpar->channels;
-				if (channels == 1 && avStream->codecpar->codec_id == AV_CODEC_ID_AAC && avStream->codecpar->profile == FF_PROFILE_AAC_HE_V2)
+				if (index == audioStreamIndex)
 				{
-					channels = 2;
-				}
-				auto info = ref new AudioStreamInfo(stream->Name, stream->Language, stream->CodecName, avStream->codecpar->bit_rate, isDefault,
-					channels, avStream->codecpar->sample_rate,
-					max(avStream->codecpar->bits_per_raw_sample, avStream->codecpar->bits_per_coded_sample));
-				if (isDefault)
-				{
+					stream->AudioInfo->SetDefault();
 					currentAudioStream = stream;
-					audioStrInfos->InsertAt(0, info);
+					audioStrInfos->InsertAt(0, stream->AudioInfo);
 					audioStreams.insert(audioStreams.begin(), stream);
 				}
 				else
 				{
-					audioStrInfos->Append(info);
+					audioStrInfos->Append(stream->AudioInfo);
 					audioStreams.push_back(stream);
 				}
 			}
@@ -751,15 +857,23 @@ HRESULT FFmpegInteropMSS::InitFFmpegContext()
 		{
 			thumbnailStreamIndex = index;
 		}
-		else if (avStream->codecpar->codec_type == AVMEDIA_TYPE_VIDEO && index == videoStreamIndex && !config->IsExternalSubtitleParser)
+		else if (avStream->codecpar->codec_type == AVMEDIA_TYPE_VIDEO && !config->IsExternalSubtitleParser)
 		{
-			videoStream = stream = CreateVideoStream(avStream, index);
-
-			if (videoStream)
+			stream = CreateVideoStream(avStream, index);
+			if (stream)
 			{
-				videoStreamInfo = ref new VideoStreamInfo(stream->Name, stream->Language, stream->CodecName, avStream->codecpar->bit_rate, true,
-					avStream->codecpar->width, avStream->codecpar->height,
-					max(avStream->codecpar->bits_per_raw_sample, avStream->codecpar->bits_per_coded_sample));
+				if (index == videoStreamIndex)
+				{
+					stream->VideoInfo->SetDefault();
+					currentVideoStream = stream;
+					videoStreams.insert(videoStreams.begin(), stream);
+					videoStrInfos->InsertAt(0, stream->VideoInfo);
+				}
+				else
+				{
+					videoStreams.push_back(stream);
+					videoStrInfos->Append(stream->VideoInfo);
+				}
 			}
 		}
 		else if (avStream->codecpar->codec_type == AVMEDIA_TYPE_SUBTITLE)
@@ -767,17 +881,15 @@ HRESULT FFmpegInteropMSS::InitFFmpegContext()
 			stream = CreateSubtitleSampleProvider(avStream, index);
 			if (stream)
 			{
-				auto isDefault = index == subtitleStreamIndex;
-				auto info = ref new SubtitleStreamInfo(stream->Name, stream->Language, stream->CodecName,
-					isDefault, (avStream->disposition & AV_DISPOSITION_FORCED) == AV_DISPOSITION_FORCED, ((SubtitleProvider^)stream)->SubtitleTrack, config->IsExternalSubtitleParser);
-				if (isDefault)
+				if (index == subtitleStreamIndex)
 				{
-					subtitleStrInfos->InsertAt(0, info);
+					stream->SubtitleInfo->SetDefault();
+					subtitleStrInfos->InsertAt(0, stream->SubtitleInfo);
 					subtitleStreams.insert(subtitleStreams.begin(), (SubtitleProvider^)stream);
 				}
 				else
 				{
-					subtitleStrInfos->Append(info);
+					subtitleStrInfos->Append(stream->SubtitleInfo);
 					subtitleStreams.push_back((SubtitleProvider^)stream);
 				}
 
@@ -796,24 +908,29 @@ HRESULT FFmpegInteropMSS::InitFFmpegContext()
 	{
 		currentAudioStream = audioStreams[0];
 	}
+	if (!currentVideoStream && videoStreams.size() > 0)
+	{
+		currentVideoStream = videoStreams[0];
+	}
 
 	audioStreamInfos = audioStrInfos->GetView();
 	subtitleStreamInfos = subtitleStrInfos->GetView();
+	videoStreamInfos = videoStrInfos->GetView();
 
-	if (videoStream)
+	if (currentVideoStream)
 	{
 		auto pixelAspect = (double)VideoDescriptor->EncodingProperties->PixelAspectRatio->Numerator / VideoDescriptor->EncodingProperties->PixelAspectRatio->Denominator;
-		auto videoAspect = ((double)videoStream->m_pAvCodecCtx->width / videoStream->m_pAvCodecCtx->height) / pixelAspect;
+		auto videoAspect = ((double)currentVideoStream->m_pAvCodecCtx->width / currentVideoStream->m_pAvCodecCtx->height) / pixelAspect;
 		for each (auto stream in subtitleStreams)
 		{
-			stream->NotifyVideoFrameSize(videoStream->m_pAvCodecCtx->width, videoStream->m_pAvCodecCtx->height, videoAspect);
+			stream->NotifyVideoFrameSize(currentVideoStream->m_pAvCodecCtx->width, currentVideoStream->m_pAvCodecCtx->height, videoAspect);
 		}
 	}
 
-	if (videoStream && currentAudioStream)
+	if (currentVideoStream && currentAudioStream)
 	{
-		mss = ref new MediaStreamSource(videoStream->StreamDescriptor, currentAudioStream->StreamDescriptor);
-		videoStream->EnableStream();
+		mss = ref new MediaStreamSource(currentVideoStream->StreamDescriptor, currentAudioStream->StreamDescriptor);
+		currentVideoStream->EnableStream();
 		currentAudioStream->EnableStream();
 	}
 	else if (currentAudioStream)
@@ -821,10 +938,10 @@ HRESULT FFmpegInteropMSS::InitFFmpegContext()
 		mss = ref new MediaStreamSource(currentAudioStream->StreamDescriptor);
 		currentAudioStream->EnableStream();
 	}
-	else if (videoStream)
+	else if (currentVideoStream)
 	{
-		mss = ref new MediaStreamSource(videoStream->StreamDescriptor);
-		videoStream->EnableStream();
+		mss = ref new MediaStreamSource(currentVideoStream->StreamDescriptor);
+		currentVideoStream->EnableStream();
 	}
 	else if (subtitleStreams.size() == 0 || !config->IsExternalSubtitleParser)
 	{
@@ -842,6 +959,49 @@ HRESULT FFmpegInteropMSS::InitFFmpegContext()
 					mss->AddStreamDescriptor(stream->StreamDescriptor);
 				}
 			}
+
+			for each (auto stream in videoStreams)
+			{
+				if (stream != currentVideoStream)
+				{
+					mss->AddStreamDescriptor(stream->StreamDescriptor);
+				}
+			}
+
+			auto chapters = ref new Vector<ChapterInfo^>();
+			if (avFormatCtx->chapters && avFormatCtx->nb_chapters > 1)
+			{
+				for (size_t i = 0; i < avFormatCtx->nb_chapters; i++)
+				{
+					auto chapter = avFormatCtx->chapters[i];
+					auto entry = av_dict_get(chapter->metadata, "title", NULL, AV_DICT_IGNORE_SUFFIX);
+					if (entry)
+					{
+						auto title = StringUtils::Utf8ToPlatformString(entry->value);
+						TimeSpan start{ (long long)((chapter->start / (double)chapter->time_base.den) * chapter->time_base.num * 10000000) };
+						TimeSpan duration{ (long long)(((chapter->end - chapter->start) / (double)chapter->time_base.den) * chapter->time_base.num * 10000000) };
+
+						// compensate for start time offset
+						if (avFormatCtx->start_time != AV_NOPTS_VALUE)
+						{
+							start.Duration -= (avFormatCtx->start_time * 10);
+						}
+
+						// cut off negative start times
+						if (start.Duration < 0)
+						{
+							duration.Duration += start.Duration;
+							start.Duration = 0;
+						}
+
+						if (duration.Duration > 0)
+						{
+							chapters->Append(ref new ChapterInfo(title, start, duration));
+						}
+					}
+				}
+			}
+			chapterInfos = chapters->GetView();
 		}
 
 		if (SUCCEEDED(hr))
@@ -849,8 +1009,8 @@ HRESULT FFmpegInteropMSS::InitFFmpegContext()
 			// Convert media duration from AV_TIME_BASE to TimeSpan unit
 			mediaDuration = { LONGLONG(avFormatCtx->duration * 10000000 / double(AV_TIME_BASE)) };
 
-			TimeSpan buffer = { 0 };
-			mss->BufferTime = buffer;
+			// Assign initial BufferTime to MediaStreamSource
+			mss->BufferTime = fileStreamData ? config->DefaultBufferTime : config->DefaultBufferTimeUri;
 
 			if (Windows::Foundation::Metadata::ApiInformation::IsPropertyPresent("Windows.Media.Core.MediaStreamSource", "MaxSupportedPlaybackRate"))
 			{
@@ -863,16 +1023,16 @@ HRESULT FFmpegInteropMSS::InitFFmpegContext()
 				mss->CanSeek = true;
 			}
 
-			startingRequestedToken = mss->Starting += ref new TypedEventHandler<MediaStreamSource ^, MediaStreamSourceStartingEventArgs ^>(this, &FFmpegInteropMSS::OnStarting);
-			sampleRequestedToken = mss->SampleRequested += ref new TypedEventHandler<MediaStreamSource ^, MediaStreamSourceSampleRequestedEventArgs ^>(this, &FFmpegInteropMSS::OnSampleRequested);
-			switchStreamRequestedToken = mss->SwitchStreamsRequested += ref new TypedEventHandler<MediaStreamSource ^, MediaStreamSourceSwitchStreamsRequestedEventArgs ^>(this, &FFmpegInteropMSS::OnSwitchStreamsRequested);
+			startingRequestedToken = mss->Starting += ref new TypedEventHandler<MediaStreamSource^, MediaStreamSourceStartingEventArgs^>(this, &FFmpegInteropMSS::OnStarting);
+			sampleRequestedToken = mss->SampleRequested += ref new TypedEventHandler<MediaStreamSource^, MediaStreamSourceSampleRequestedEventArgs^>(this, &FFmpegInteropMSS::OnSampleRequested);
+			switchStreamRequestedToken = mss->SwitchStreamsRequested += ref new TypedEventHandler<MediaStreamSource^, MediaStreamSourceSwitchStreamsRequestedEventArgs^>(this, &FFmpegInteropMSS::OnSwitchStreamsRequested);
 		}
 	}
-	
+
 	return hr;
 }
 
-SubtitleProvider^ FFmpegInteropMSS::CreateSubtitleSampleProvider(AVStream * avStream, int index)
+SubtitleProvider^ FFmpegInteropMSS::CreateSubtitleSampleProvider(AVStream* avStream, int index)
 {
 	HRESULT hr = S_OK;
 	SubtitleProvider^ avSubsStream = nullptr;
@@ -891,8 +1051,7 @@ SubtitleProvider^ FFmpegInteropMSS::CreateSubtitleSampleProvider(AVStream * avSt
 		if (config->AutoCorrectAnsiSubtitles && config->IsExternalSubtitleParser && streamByteOrderMark != ByteOrderMark::UTF8)
 		{
 			String^ key = config->AnsiSubtitleEncoding->Name;
-			std::wstring keyW(key->Begin());
-			std::string keyA(keyW.begin(), keyW.end());
+			std::string keyA = StringUtils::PlatformStringToUtf8String(key);
 			const char* keyChar = keyA.c_str();
 
 			if (av_opt_set(avSubsCodecCtx, "sub_charenc", keyChar, AV_OPT_SEARCH_CHILDREN) < 0)
@@ -965,7 +1124,7 @@ SubtitleProvider^ FFmpegInteropMSS::CreateSubtitleSampleProvider(AVStream * avSt
 	return avSubsStream;
 }
 
-MediaSampleProvider^ FFmpegInteropMSS::CreateAudioStream(AVStream * avStream, int index)
+MediaSampleProvider^ FFmpegInteropMSS::CreateAudioStream(AVStream* avStream, int index)
 {
 	HRESULT hr = S_OK;
 	MediaSampleProvider^ audioStream = nullptr;
@@ -1041,7 +1200,7 @@ MediaSampleProvider^ FFmpegInteropMSS::CreateAudioStream(AVStream * avStream, in
 	return audioStream;
 }
 
-MediaSampleProvider^ FFmpegInteropMSS::CreateVideoStream(AVStream * avStream, int index)
+MediaSampleProvider^ FFmpegInteropMSS::CreateVideoStream(AVStream* avStream, int index)
 {
 	HRESULT hr = S_OK;
 	MediaSampleProvider^ result = nullptr;
@@ -1053,10 +1212,63 @@ MediaSampleProvider^ FFmpegInteropMSS::CreateVideoStream(AVStream * avStream, in
 	{
 		// allocate a new decoding context
 		auto avVideoCodecCtx = avcodec_alloc_context3(avVideoCodec);
+
+
 		if (!avVideoCodecCtx)
 		{
 			DebugMessage(L"Could not allocate a decoding context\n");
 			hr = E_OUTOFMEMORY;
+		}
+
+		// create and assign HW device context, if supported and requested
+		if (SUCCEEDED(hr) && config->VideoDecoderMode == VideoDecoderMode::Automatic)
+		{
+			int i = 0;
+			while (true)
+			{
+				auto config = avcodec_get_hw_config(avVideoCodec, i++);
+				if (config)
+				{
+					if (config->pix_fmt == AV_PIX_FMT_D3D11 && config->methods & AV_CODEC_HW_CONFIG_METHOD_HW_DEVICE_CTX)
+					{
+						AVBufferRef* hwContext;
+						if (!avHardwareContext)
+						{
+							avHardwareContext = av_hwdevice_ctx_alloc(AVHWDeviceType::AV_HWDEVICE_TYPE_D3D11VA);
+						}
+
+
+						if (avVideoCodecCtx->codec_id == AV_CODEC_ID_VC1 || avVideoCodecCtx->codec_id == AV_CODEC_ID_WMV3)
+						{
+							// workaround for VC1 and WMV3: use default device context, later replace with actual MSS device context
+							if (!avHardwareContextDefault)
+							{
+								av_hwdevice_ctx_create(&avHardwareContextDefault, AVHWDeviceType::AV_HWDEVICE_TYPE_D3D11VA, NULL, NULL, 0);
+								av_hwdevice_ctx_init(avHardwareContextDefault);
+							}
+							hwContext = avHardwareContextDefault;
+						}
+						else
+						{
+							hwContext = avHardwareContext;
+						}
+
+						if (hwContext)
+						{
+							avVideoCodecCtx->hw_device_ctx = av_buffer_ref(hwContext);
+						}
+						else
+						{
+							hr = E_OUTOFMEMORY;
+						}
+						break;
+					}
+				}
+				else
+				{
+					break;
+				}
+			}
 		}
 
 		if (SUCCEEDED(hr))
@@ -1084,10 +1296,6 @@ MediaSampleProvider^ FFmpegInteropMSS::CreateVideoStream(AVStream * avStream, in
 			{
 				hr = E_FAIL;
 			}
-			else if (avVideoCodecCtx->pix_fmt == AV_PIX_FMT_NONE)
-			{
-				hr = E_FAIL;
-			}
 			else
 			{
 				// Detect video format and create video stream descriptor accordingly
@@ -1110,7 +1318,7 @@ void FFmpegInteropMSS::SetSubtitleDelay(TimeSpan offset)
 	mutexGuard.lock();
 	try
 	{
-		for each(auto subtitleStream in subtitleStreams)
+		for each (auto subtitleStream in subtitleStreams)
 		{
 			subtitleStream->SetSubtitleDelay(offset);
 		}
@@ -1137,9 +1345,9 @@ void FFmpegInteropMSS::SetAudioEffects(IVectorView<AvEffectDefinition^>^ audioEf
 void FFmpegInteropMSS::SetVideoEffects(IVectorView<AvEffectDefinition^>^ videoEffects)
 {
 	mutexGuard.lock();
-	if (videoStream)
+	if (currentVideoStream)
 	{
-		videoStream->SetFilters(videoEffects);
+		currentVideoStream->SetFilters(videoEffects);
 	}
 	mutexGuard.unlock();
 }
@@ -1158,14 +1366,14 @@ void FFmpegInteropMSS::DisableAudioEffects()
 void FFmpegInteropMSS::DisableVideoEffects()
 {
 	mutexGuard.lock();
-	if (videoStream)
+	if (currentVideoStream)
 	{
-		videoStream->DisableFilters();
+		currentVideoStream->DisableFilters();
 	}
 	mutexGuard.unlock();
 }
 
-MediaThumbnailData ^ FFmpegInteropMSS::ExtractThumbnail()
+MediaThumbnailData^ FFmpegInteropMSS::ExtractThumbnail()
 {
 	if (thumbnailStreamIndex != AVERROR_STREAM_NOT_FOUND)
 	{
@@ -1212,12 +1420,12 @@ MediaSampleProvider^ FFmpegInteropMSS::CreateAudioSampleProvider(AVStream* avStr
 		{
 			encodingProperties = AudioEncodingProperties::CreateAac(avAudioCodecCtx->profile == FF_PROFILE_AAC_HE || avAudioCodecCtx->profile == FF_PROFILE_AAC_HE_V2 ? avAudioCodecCtx->sample_rate / 2 : avAudioCodecCtx->sample_rate, avAudioCodecCtx->channels, (unsigned int)avAudioCodecCtx->bit_rate);
 		}
-		audioSampleProvider = ref new CompressedSampleProvider(m_pReader, avFormatCtx, avAudioCodecCtx, config, index, encodingProperties);
+		audioSampleProvider = ref new CompressedSampleProvider(m_pReader, avFormatCtx, avAudioCodecCtx, config, index, encodingProperties, HardwareDecoderStatus::Unknown);
 	}
 	else if (avAudioCodecCtx->codec_id == AV_CODEC_ID_MP3 && config->PassthroughAudioMP3)
 	{
 		AudioEncodingProperties^ encodingProperties = AudioEncodingProperties::CreateMp3(avAudioCodecCtx->sample_rate, avAudioCodecCtx->channels, (unsigned int)avAudioCodecCtx->bit_rate);
-		audioSampleProvider = ref new CompressedSampleProvider(m_pReader, avFormatCtx, avAudioCodecCtx, config, index, encodingProperties);
+		audioSampleProvider = ref new CompressedSampleProvider(m_pReader, avFormatCtx, avAudioCodecCtx, config, index, encodingProperties, HardwareDecoderStatus::Unknown);
 	}
 	else
 	{
@@ -1237,22 +1445,32 @@ MediaSampleProvider^ FFmpegInteropMSS::CreateVideoSampleProvider(AVStream* avStr
 {
 	MediaSampleProvider^ videoSampleProvider;
 	VideoEncodingProperties^ videoProperties;
+	HardwareDecoderStatus hardwareDecoderStatus;
 
-	if (avVideoCodecCtx->codec_id == AV_CODEC_ID_H264 && config->PassthroughVideoH264 && !config->IsFrameGrabber && (avVideoCodecCtx->profile <= 100 || config->PassthroughVideoH264Hi10P))
+#pragma warning (disable: 4973)
+
+	if (config->VideoDecoderMode == VideoDecoderMode::AutoDetection || config->VideoDecoderMode == VideoDecoderMode::AutomaticSystemDecoder)
+	{
+		CodecChecker::Initialize();
+	}
+
+	if (avVideoCodecCtx->codec_id == AV_CODEC_ID_H264 &&
+		(CheckUseHardwareAcceleration(avVideoCodecCtx, CodecChecker::HardwareAccelerationH264, hardwareDecoderStatus, config->PassthroughVideoH264, config->PassthroughVideoH264MaxProfile, config->PassthroughVideoH264MaxLevel)))
 	{
 		auto videoProperties = VideoEncodingProperties::CreateH264();
 
 		// Check for H264 bitstream flavor. H.264 AVC extradata starts with 1 while non AVC one starts with 0
 		if (avVideoCodecCtx->extradata != nullptr && avVideoCodecCtx->extradata_size > 0 && avVideoCodecCtx->extradata[0] == 1)
 		{
-			videoSampleProvider = ref new H264AVCSampleProvider(m_pReader, avFormatCtx, avVideoCodecCtx, config, index, videoProperties);
+			videoSampleProvider = ref new H264AVCSampleProvider(m_pReader, avFormatCtx, avVideoCodecCtx, config, index, videoProperties, hardwareDecoderStatus);
 		}
 		else
 		{
-			videoSampleProvider = ref new NALPacketSampleProvider(m_pReader, avFormatCtx, avVideoCodecCtx, config, index, videoProperties);
+			videoSampleProvider = ref new NALPacketSampleProvider(m_pReader, avFormatCtx, avVideoCodecCtx, config, index, videoProperties, hardwareDecoderStatus);
 		}
 	}
-	else if (avVideoCodecCtx->codec_id == AV_CODEC_ID_HEVC && config->PassthroughVideoHEVC && !config->IsFrameGrabber &&
+	else if (avVideoCodecCtx->codec_id == AV_CODEC_ID_HEVC &&
+		CheckUseHardwareAcceleration(avVideoCodecCtx, CodecChecker::HardwareAccelerationHEVC, hardwareDecoderStatus, config->PassthroughVideoHEVC, config->PassthroughVideoHEVCMaxProfile, config->PassthroughVideoHEVCMaxLevel) &&
 		Windows::Foundation::Metadata::ApiInformation::IsMethodPresent("Windows.Media.MediaProperties.VideoEncodingProperties", "CreateHevc"))
 	{
 		auto videoProperties = VideoEncodingProperties::CreateHevc();
@@ -1261,50 +1479,77 @@ MediaSampleProvider^ FFmpegInteropMSS::CreateVideoSampleProvider(AVStream* avStr
 		if (avVideoCodecCtx->extradata != nullptr && avVideoCodecCtx->extradata_size > 22 &&
 			(avVideoCodecCtx->extradata[0] || avVideoCodecCtx->extradata[1] || avVideoCodecCtx->extradata[2] > 1))
 		{
-			videoSampleProvider = ref new HEVCSampleProvider(m_pReader, avFormatCtx, avVideoCodecCtx, config, index, videoProperties);
+			videoSampleProvider = ref new HEVCSampleProvider(m_pReader, avFormatCtx, avVideoCodecCtx, config, index, videoProperties, hardwareDecoderStatus);
 		}
 		else
 		{
-			videoSampleProvider = ref new NALPacketSampleProvider(m_pReader, avFormatCtx, avVideoCodecCtx, config, index, videoProperties);
+			videoSampleProvider = ref new NALPacketSampleProvider(m_pReader, avFormatCtx, avVideoCodecCtx, config, index, videoProperties, hardwareDecoderStatus);
 		}
 	}
-	else if (avVideoCodecCtx->codec_id == AV_CODEC_ID_WMV3 && config->PassthroughVideoWMV3 && !config->IsFrameGrabber && avVideoCodecCtx->extradata_size > 0)
+	else if (avVideoCodecCtx->codec_id == AV_CODEC_ID_WMV3 &&
+		CheckUseHardwareAcceleration(avVideoCodecCtx, CodecChecker::HardwareAccelerationWMV3, hardwareDecoderStatus, config->PassthroughVideoWMV3, -1, -1) &&
+		avVideoCodecCtx->extradata_size > 0)
 	{
 		auto videoProperties = ref new VideoEncodingProperties();
 		videoProperties->Subtype = MediaEncodingSubtypes::Wmv3;
 
 		auto extradata = Platform::ArrayReference<uint8_t>(avVideoCodecCtx->extradata, avVideoCodecCtx->extradata_size);
 		videoProperties->SetFormatUserData(extradata);
-		videoSampleProvider = ref new CompressedSampleProvider(m_pReader, avFormatCtx, avVideoCodecCtx, config, index, videoProperties);
+		videoSampleProvider = ref new CompressedSampleProvider(m_pReader, avFormatCtx, avVideoCodecCtx, config, index, videoProperties, hardwareDecoderStatus);
 	}
-	else if (avVideoCodecCtx->codec_id == AV_CODEC_ID_VC1 && config->PassthroughVideoVC1 && !config->IsFrameGrabber && avVideoCodecCtx->extradata_size > 0)
+	else if (avVideoCodecCtx->codec_id == AV_CODEC_ID_VC1 &&
+		CheckUseHardwareAcceleration(avVideoCodecCtx, CodecChecker::HardwareAccelerationVC1, hardwareDecoderStatus, config->PassthroughVideoVC1, -1, -1) &&
+		avVideoCodecCtx->extradata_size > 0)
 	{
 		auto videoProperties = ref new VideoEncodingProperties();
 		videoProperties->Subtype = MediaEncodingSubtypes::Wvc1;
 
 		auto extradata = Platform::ArrayReference<uint8_t>(avVideoCodecCtx->extradata, avVideoCodecCtx->extradata_size);
 		videoProperties->SetFormatUserData(extradata);
-		videoSampleProvider = ref new CompressedSampleProvider(m_pReader, avFormatCtx, avVideoCodecCtx, config, index, videoProperties);
+		videoSampleProvider = ref new CompressedSampleProvider(m_pReader, avFormatCtx, avVideoCodecCtx, config, index, videoProperties, hardwareDecoderStatus);
 	}
-	else if (avVideoCodecCtx->codec_id == AV_CODEC_ID_MPEG2VIDEO && config->PassthroughVideoMPEG2 && !config->IsFrameGrabber)
+	else if (avVideoCodecCtx->codec_id == AV_CODEC_ID_MPEG2VIDEO &&
+		CheckUseHardwareAcceleration(avVideoCodecCtx, CodecChecker::HardwareAccelerationMPEG2, hardwareDecoderStatus, config->PassthroughVideoMPEG2, -1, -1))
 	{
 		auto videoProperties = ref new VideoEncodingProperties();
 		videoProperties->Subtype = MediaEncodingSubtypes::Mpeg2;
 
-		videoSampleProvider = ref new CompressedSampleProvider(m_pReader, avFormatCtx, avVideoCodecCtx, config, index, videoProperties);
+		videoSampleProvider = ref new CompressedSampleProvider(m_pReader, avFormatCtx, avVideoCodecCtx, config, index, videoProperties, hardwareDecoderStatus);
 	}
-	else if (avVideoCodecCtx->codec_id == AV_CODEC_ID_VP9 && config->PassthroughVideoVP9 && !config->IsFrameGrabber &&
+	else if (avVideoCodecCtx->codec_id == AV_CODEC_ID_VP9 &&
+		CheckUseHardwareAcceleration(avVideoCodecCtx, CodecChecker::HardwareAccelerationVP9, hardwareDecoderStatus, config->PassthroughVideoVP9 && !(avVideoCodecCtx->profile & 0x01), -1, -1) &&
 		Windows::Foundation::Metadata::ApiInformation::IsPropertyPresent("Windows.Media.MediaProperties.MediaEncodingSubtypes", "Vp9"))
 	{
 		auto videoProperties = ref new VideoEncodingProperties();
 		videoProperties->Subtype = MediaEncodingSubtypes::Vp9;
 
-		videoSampleProvider = ref new CompressedSampleProvider(m_pReader, avFormatCtx, avVideoCodecCtx, config, index, videoProperties);
+		videoSampleProvider = ref new CompressedSampleProvider(m_pReader, avFormatCtx, avVideoCodecCtx, config, index, videoProperties, hardwareDecoderStatus);
+	}
+	else if (avVideoCodecCtx->codec_id == AV_CODEC_ID_VP8 &&
+		CheckUseHardwareAcceleration(avVideoCodecCtx, CodecChecker::HardwareAccelerationVP8, hardwareDecoderStatus, config->PassthroughVideoVP8, -1, -1) &&
+		Windows::Foundation::Metadata::ApiInformation::IsTypePresent("Windows.Media.Core.CodecSubtypes"))
+
+	{
+		auto videoProperties = ref new VideoEncodingProperties();
+		videoProperties->Subtype = Windows::Media::Core::CodecSubtypes::VideoFormatVP80;
+
+		videoSampleProvider = ref new CompressedSampleProvider(m_pReader, avFormatCtx, avVideoCodecCtx, config, index, videoProperties, hardwareDecoderStatus);
+	}
+	else if (avVideoCodecCtx->hw_device_ctx)
+	{
+		hardwareDecoderStatus = HardwareDecoderStatus::Available;
+		videoSampleProvider = ref new D3D11VideoSampleProvider(m_pReader, avFormatCtx, avVideoCodecCtx, config, index, hardwareDecoderStatus);
 	}
 	else
 	{
-		videoSampleProvider = ref new UncompressedVideoSampleProvider(m_pReader, avFormatCtx, avVideoCodecCtx, config, index);
+		if (config->VideoDecoderMode == VideoDecoderMode::AutoDetection || config->VideoDecoderMode == VideoDecoderMode::AutomaticSystemDecoder)
+		{
+			hardwareDecoderStatus = HardwareDecoderStatus::NotAvailable;
+		}
+		videoSampleProvider = ref new UncompressedVideoSampleProvider(m_pReader, avFormatCtx, avVideoCodecCtx, config, index, hardwareDecoderStatus);
 	}
+
+#pragma warning (default: 4973)
 
 	auto hr = videoSampleProvider->Initialize();
 
@@ -1344,9 +1589,48 @@ HRESULT FFmpegInteropMSS::ParseOptions(PropertySet^ ffmpegOptions)
 	return hr;
 }
 
-void FFmpegInteropMSS::OnStarting(MediaStreamSource ^sender, MediaStreamSourceStartingEventArgs ^args)
+void FFmpegInteropMSS::OnStarting(MediaStreamSource^ sender, MediaStreamSourceStartingEventArgs^ args)
 {
 	MediaStreamSourceStartingRequest^ request = args->Request;
+
+	if (isFirstSeek && avHardwareContext)
+	{
+		HRESULT hr = D3D11VideoSampleProvider::InitializeHardwareDeviceContext(sender, avHardwareContext, &device, &deviceContext);
+
+		if (SUCCEEDED(hr))
+		{
+			// assign device and context
+			for each (auto stream in videoStreams)
+			{
+				if (stream->m_pAvCodecCtx->hw_device_ctx)
+				{
+					// replace default device context with actual mss device, if required
+					if (stream->m_pAvCodecCtx->hw_device_ctx->data != avHardwareContext->data)
+					{
+						av_buffer_unref(&stream->m_pAvCodecCtx->hw_device_ctx);
+						stream->m_pAvCodecCtx->hw_device_ctx = av_buffer_ref(avHardwareContext);
+					}
+
+					// set device pointers to stream
+					stream->SetHardwareDevice(device, deviceContext);
+				}
+			}
+		}
+		else
+		{
+			// unref all hw device contexts
+			for each (auto stream in videoStreams)
+			{
+				if (stream->m_pAvCodecCtx->hw_device_ctx)
+				{
+					av_buffer_unref(&stream->m_pAvCodecCtx->hw_device_ctx);
+				}
+			}
+			av_buffer_unref(&avHardwareContext);
+			SAFE_RELEASE(device);
+			SAFE_RELEASE(deviceContext);
+		}
+	}
 
 	// Perform seek operation when MediaStreamSource received seek event from MediaElement
 	if (request->StartPosition && request->StartPosition->Value.Duration <= mediaDuration.Duration && (!isFirstSeek || request->StartPosition->Value.Duration > 0))
@@ -1357,9 +1641,9 @@ void FFmpegInteropMSS::OnStarting(MediaStreamSource ^sender, MediaStreamSourceSt
 			request->SetActualStartPosition(request->StartPosition->Value);
 		}
 
-		if (videoStream && !videoStream->IsEnabled)
+		if (currentVideoStream && !currentVideoStream->IsEnabled)
 		{
-			videoStream->EnableStream();
+			currentVideoStream->EnableStream();
 		}
 
 		if (currentAudioStream && !currentAudioStream->IsEnabled)
@@ -1371,7 +1655,7 @@ void FFmpegInteropMSS::OnStarting(MediaStreamSource ^sender, MediaStreamSourceSt
 	isFirstSeek = false;
 }
 
-void FFmpegInteropMSS::OnSampleRequested(Windows::Media::Core::MediaStreamSource ^sender, MediaStreamSourceSampleRequestedEventArgs ^args)
+void FFmpegInteropMSS::OnSampleRequested(Windows::Media::Core::MediaStreamSource^ sender, MediaStreamSourceSampleRequestedEventArgs^ args)
 {
 	mutexGuard.lock();
 	if (mss != nullptr)
@@ -1380,9 +1664,9 @@ void FFmpegInteropMSS::OnSampleRequested(Windows::Media::Core::MediaStreamSource
 		{
 			args->Request->Sample = currentAudioStream->GetNextSample();
 		}
-		else if (videoStream && args->Request->StreamDescriptor == videoStream->StreamDescriptor)
+		else if (currentVideoStream && args->Request->StreamDescriptor == currentVideoStream->StreamDescriptor)
 		{
-			args->Request->Sample = videoStream->GetNextSample();
+			args->Request->Sample = currentVideoStream->GetNextSample();;
 		}
 		else
 		{
@@ -1392,9 +1676,10 @@ void FFmpegInteropMSS::OnSampleRequested(Windows::Media::Core::MediaStreamSource
 	mutexGuard.unlock();
 }
 
-void FFmpegInteropMSS::OnSwitchStreamsRequested(MediaStreamSource ^ sender, MediaStreamSourceSwitchStreamsRequestedEventArgs ^ args)
+void FFmpegInteropMSS::OnSwitchStreamsRequested(MediaStreamSource^ sender, MediaStreamSourceSwitchStreamsRequestedEventArgs^ args)
 {
 	mutexGuard.lock();
+
 	if (currentAudioStream && args->Request->OldStreamDescriptor == currentAudioStream->StreamDescriptor)
 	{
 		if (currentAudioEffects)
@@ -1404,6 +1689,12 @@ void FFmpegInteropMSS::OnSwitchStreamsRequested(MediaStreamSource ^ sender, Medi
 		currentAudioStream->DisableStream();
 		currentAudioStream = nullptr;
 	}
+	if (currentVideoStream && args->Request->OldStreamDescriptor == currentVideoStream->StreamDescriptor)
+	{
+		currentVideoStream->DisableStream();
+		currentVideoStream = nullptr;
+	}
+
 	for each (auto stream in audioStreams)
 	{
 		if (stream->StreamDescriptor == args->Request->NewStreamDescriptor)
@@ -1416,6 +1707,15 @@ void FFmpegInteropMSS::OnSwitchStreamsRequested(MediaStreamSource ^ sender, Medi
 			}
 		}
 	}
+	for each (auto stream in videoStreams)
+	{
+		if (stream->StreamDescriptor == args->Request->NewStreamDescriptor)
+		{
+			currentVideoStream = stream;
+			currentVideoStream->EnableStream();
+		}
+	}
+
 	mutexGuard.unlock();
 }
 
@@ -1424,7 +1724,7 @@ HRESULT FFmpegInteropMSS::Seek(TimeSpan position)
 	auto hr = S_OK;
 
 	// Select the first valid stream either from video or audio
-	int streamIndex = videoStream ? videoStream->StreamIndex : currentAudioStream ? currentAudioStream->StreamIndex : -1;
+	int streamIndex = currentVideoStream ? currentVideoStream->StreamIndex : currentAudioStream ? currentAudioStream->StreamIndex : -1;
 
 	if (streamIndex >= 0)
 	{
@@ -1468,7 +1768,7 @@ HRESULT FFmpegInteropMSS::Seek(TimeSpan position)
 	return hr;
 }
 
-CoreDispatcher ^ FFmpegInterop::FFmpegInteropMSS::GetCurrentDispatcher()
+CoreDispatcher^ FFmpegInterop::FFmpegInteropMSS::GetCurrentDispatcher()
 {
 	try {
 		//try get the current view
@@ -1506,7 +1806,7 @@ static int FileStreamRead(void* ptr, uint8_t* buf, int bufSize)
 	{
 		if (bytesRead >= 4)
 		{
-			auto bom = ((uint32 *)buf)[0];
+			auto bom = ((uint32*)buf)[0];
 			if ((bom & 0x00FFFFFF) == 0x00BFBBEF)
 			{
 				mss->streamByteOrderMark = ByteOrderMark::UTF8;

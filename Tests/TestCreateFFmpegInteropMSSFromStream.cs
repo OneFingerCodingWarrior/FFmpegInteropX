@@ -131,7 +131,7 @@ namespace UnitTest.Windows
             Assert.IsNotNull(readStream);
 
             // CreateFromStreamAsync should return valid FFmpegInteropMSS object which generates valid MediaStreamSource object
-            FFmpegInteropMSS FFmpegMSS = await FFmpegInteropMSS.CreateFromStreamAsync(readStream, new FFmpegInteropConfig { PassthroughVideoH264 = false });
+            FFmpegInteropMSS FFmpegMSS = await FFmpegInteropMSS.CreateFromStreamAsync(readStream, new FFmpegInteropConfig { VideoDecoderMode = VideoDecoderMode.ForceFFmpegSoftwareDecoder });
             Assert.IsNotNull(FFmpegMSS);
 
             MediaStreamSource mss = FFmpegMSS.GetMediaStreamSource();
@@ -167,7 +167,7 @@ namespace UnitTest.Windows
 
             // Validate the metadata
             Assert.AreEqual(FFmpegMSS.AudioStreams[0].CodecName.ToLowerInvariant(), "aac");
-            Assert.AreEqual(FFmpegMSS.VideoStream.CodecName.ToLowerInvariant(), "h264");
+            Assert.AreEqual(FFmpegMSS.VideoStreams[0].CodecName.ToLowerInvariant(), "h264");
 
             MediaStreamSource mss = FFmpegMSS.GetMediaStreamSource();
             Assert.IsNotNull(mss);

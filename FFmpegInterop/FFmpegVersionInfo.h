@@ -34,7 +34,7 @@ void CheckFFmpegVersion(String^ current, String^ min)
 
 	if (countV < 2 || countMin < 2)
 	{
-		throw ref new COMException(E_UNEXPECTED);
+		OutputDebugString(L"Failed to parse ffmpeg version number.");
 	}
 	else if (min1 > v1 || (min1 == v1 && min2 > v2) || (min1 == v1 && min2 == v2 && min3 > v3))
 	{
@@ -49,7 +49,7 @@ namespace FFmpegInterop
 	{
 	public:
 		static property String^ MinimumVersion { String^ get() { return "4.0"; } };
-		static property String^ RecommendedVersion { String^ get() { return "4.1.1"; } };
+		static property String^ RecommendedVersion { String^ get() { return "4.2.1"; } };
 		static property String^ CurrentVersion 
 		{ 
 			String^ get()

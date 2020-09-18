@@ -25,6 +25,7 @@
 
 #include "MainPage.g.h"
 #include "FloatToDoubleConverter.h"
+#include "TimeSpanToDoubleConverter.h"
 
 namespace MediaPlayerCPP
 {
@@ -38,6 +39,8 @@ namespace MediaPlayerCPP
 
 	private:
 		void OpenLocalFile(Platform::Object^ sender, Windows::UI::Xaml::RoutedEventArgs^ e);
+		void OpenLocalFile(Windows::Storage::StorageFile^ file);
+		void TryOpenLastFile();
 		void URIBoxKeyUp(Platform::Object^ sender, Windows::UI::Xaml::Input::KeyRoutedEventArgs^ e);
 		void MediaFailed(Platform::Object^ sender, Windows::UI::Xaml::ExceptionRoutedEventArgs^ e);
 		void ExtractFrame(Platform::Object^ sender, Windows::UI::Xaml::RoutedEventArgs^ e);
@@ -51,6 +54,7 @@ namespace MediaPlayerCPP
 		void PassthroughVideo_Toggled(Platform::Object^ sender, Windows::UI::Xaml::RoutedEventArgs^ e);
 
 		Windows::Storage::StorageFile^ currentFile;
+		FFmpegInterop::FFmpegInteropMSS^ actualFFmpegMSS;
 		FFmpegInterop::FFmpegInteropMSS^ FFmpegMSS;
 		Windows::Media::Playback::MediaPlaybackItem^ playbackItem;
 		Windows::Foundation::EventRegistrationToken timedMetadataTracksChangedToken;
@@ -61,5 +65,8 @@ namespace MediaPlayerCPP
 		void QuickenSubtitles(Platform::Object^ sender, Windows::UI::Xaml::RoutedEventArgs^ e);
 		void MediaOpened(Platform::Object^ sender, Windows::UI::Xaml::RoutedEventArgs^ e);
 		void EnableVideoEffects_Toggled(Platform::Object^ sender, Windows::UI::Xaml::RoutedEventArgs^ e);
+		void AutoDetect_Toggled(Platform::Object^ sender, Windows::UI::Xaml::RoutedEventArgs^ e);
+		
+		void OnKeyDown(Windows::UI::Core::CoreWindow^ sender, Windows::UI::Core::KeyEventArgs^ args);
 	};
 }

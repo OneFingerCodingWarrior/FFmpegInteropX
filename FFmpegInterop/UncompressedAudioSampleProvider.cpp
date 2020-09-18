@@ -38,7 +38,7 @@ UncompressedAudioSampleProvider::UncompressedAudioSampleProvider(
 	AVCodecContext* avCodecCtx,
 	FFmpegInteropConfig^ config,
 	int streamIndex)
-	: UncompressedSampleProvider(reader, avFormatCtx, avCodecCtx, config, streamIndex)
+	: UncompressedSampleProvider(reader, avFormatCtx, avCodecCtx, config, streamIndex, HardwareDecoderStatus::Unknown)
 	, m_pSwrCtx(nullptr)
 {
 }
@@ -174,7 +174,7 @@ UncompressedAudioSampleProvider::~UncompressedAudioSampleProvider()
 	swr_free(&m_pSwrCtx);
 }
 
-HRESULT UncompressedAudioSampleProvider::CreateBufferFromFrame(IBuffer^* pBuffer, AVFrame* avFrame, int64_t& framePts, int64_t& frameDuration)
+HRESULT UncompressedAudioSampleProvider::CreateBufferFromFrame(IBuffer^* pBuffer, IDirect3DSurface^* surface, AVFrame* avFrame, int64_t& framePts, int64_t& frameDuration)
 {
 	HRESULT hr = S_OK;
 
@@ -219,7 +219,10 @@ HRESULT UncompressedAudioSampleProvider::CreateBufferFromFrame(IBuffer^* pBuffer
 	{
 		// always update duration with real decoded sample duration
 		auto actualDuration = (long long)avFrame->nb_samples * m_pAvStream->time_base.den / (outSampleRate * m_pAvStream->time_base.num);
-
+		if (actualDuration == 0)
+		{
+			actualDuration = 1;
+		}
 		if (frameDuration != actualDuration)
 		{
 			// compensate for start encoder padding (gapless playback)

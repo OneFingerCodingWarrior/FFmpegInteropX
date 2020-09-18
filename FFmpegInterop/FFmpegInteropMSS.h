@@ -20,6 +20,7 @@
 #include <queue>
 #include <mutex>
 #include <pplawait.h>
+#include "Enumerations.h"
 #include "FFmpegReader.h"
 #include "MediaSampleProvider.h"
 #include "MediaThumbnailData.h"
@@ -28,6 +29,7 @@
 #include "StreamInfo.h"
 #include "SubtitleProvider.h"
 #include "AttachedFileHelper.h"
+#include "CodecChecker.h"
 #include <collection.h>
 #include "MediaMetadata.h"
 
@@ -138,7 +140,7 @@ namespace FFmpegInterop
 			{
 				return config;
 			}
-		}		
+		}
 
 		property IVectorView<IKeyValuePair<String^, String^>^>^ MetadataTags
 		{
@@ -158,10 +160,40 @@ namespace FFmpegInterop
 			};
 		};
 
-		///<summary>Gets video stream information.</summary>
+		///<summary>Gets the first video stream information.</summary>
+		[WFM::Deprecated("Use the CurrentVideoStream property.", WFM::DeprecationType::Deprecate, 0x0)]
 		property VideoStreamInfo^ VideoStream
 		{
-			VideoStreamInfo^ get() { return videoStreamInfo; }
+			VideoStreamInfo^ get()
+			{
+				return videoStrInfos->Size > 0 ? videoStrInfos->GetAt(0) : nullptr;
+			}
+		}
+
+		///<summary>Gets the current video stream information.</summary>
+		property VideoStreamInfo^ CurrentVideoStream
+		{
+			VideoStreamInfo^ get()
+			{
+				auto stream = currentVideoStream;
+				return stream ? stream->VideoInfo : nullptr;
+			}
+		}
+
+		///<summary>Gets the current audio stream information.</summary>
+		property AudioStreamInfo^ CurrentAudioStream
+		{
+			AudioStreamInfo^ get()
+			{
+				auto stream = currentAudioStream;
+				return stream ? stream->AudioInfo : nullptr;
+			}
+		}
+
+		///<summary>Gets video stream information</summary>
+		property IVectorView<VideoStreamInfo^>^ VideoStreams
+		{
+			IVectorView<VideoStreamInfo^>^ get() { return videoStreamInfos; }
 		}
 
 		///<summary>Gets audio stream information.</summary>
@@ -174,6 +206,12 @@ namespace FFmpegInterop
 		property IVectorView<SubtitleStreamInfo^>^ SubtitleStreams
 		{
 			IVectorView<SubtitleStreamInfo^>^ get() { return subtitleStreamInfos; }
+		}
+
+		///<summary>Gets chapter information.</summary>
+		property IVectorView<ChapterInfo^>^ ChapterInfos
+		{
+			IVectorView<ChapterInfo^>^ get() { return chapterInfos; }
 		}
 
 		///<summary>Gets a boolean indication if a thumbnail is embedded in the file.</summary>
@@ -196,7 +234,7 @@ namespace FFmpegInterop
 		{
 			VideoStreamDescriptor^ get()
 			{
-				return videoStream ? dynamic_cast<VideoStreamDescriptor^>(videoStream->StreamDescriptor) : nullptr;
+				return currentVideoStream ? dynamic_cast<VideoStreamDescriptor^>(currentVideoStream->StreamDescriptor) : nullptr;
 			};
 		};
 
@@ -205,7 +243,7 @@ namespace FFmpegInterop
 		{
 			String^ get()
 			{
-				return videoStream ? videoStream->CodecName : nullptr;
+				return currentVideoStream ? currentVideoStream->CodecName : nullptr;
 			};
 		};
 
@@ -233,6 +271,14 @@ namespace FFmpegInterop
 			TimeSpan get() { return subtitleDelay; }
 		}
 
+		///<summary>Gets or sets the BufferTime of the MediaStreamSource.</summary>
+		///<remarks>A value of 0 is recommended for local files, streaming sources should use higher values.</remarks>
+		property TimeSpan BufferTime
+		{
+			TimeSpan get() { return mss->BufferTime; }
+			void set(TimeSpan value) { mss->BufferTime = value; }
+		}
+
 
 	private:
 		FFmpegInteropMSS(FFmpegInteropConfig^ config, CoreDispatcher^ dispatcher);
@@ -241,19 +287,19 @@ namespace FFmpegInterop
 		HRESULT CreateMediaStreamSource(String^ uri);
 		HRESULT InitFFmpegContext();
 		MediaSource^ CreateMediaSource();
-		MediaSampleProvider^ CreateAudioStream(AVStream * avStream, int index);
-		MediaSampleProvider^ CreateVideoStream(AVStream * avStream, int index);
-		SubtitleProvider^ CreateSubtitleSampleProvider(AVStream * avStream, int index);
-		MediaSampleProvider^ CreateAudioSampleProvider(AVStream * avStream, AVCodecContext* avCodecCtx, int index);
-		MediaSampleProvider^ CreateVideoSampleProvider(AVStream * avStream, AVCodecContext* avCodecCtx, int index);
+		MediaSampleProvider^ CreateAudioStream(AVStream* avStream, int index);
+		MediaSampleProvider^ CreateVideoStream(AVStream* avStream, int index);
+		SubtitleProvider^ CreateSubtitleSampleProvider(AVStream* avStream, int index);
+		MediaSampleProvider^ CreateAudioSampleProvider(AVStream* avStream, AVCodecContext* avCodecCtx, int index);
+		MediaSampleProvider^ CreateVideoSampleProvider(AVStream* avStream, AVCodecContext* avCodecCtx, int index);
 		HRESULT ParseOptions(PropertySet^ ffmpegOptions);
-		void OnStarting(MediaStreamSource ^sender, MediaStreamSourceStartingEventArgs ^args);
-		void OnSampleRequested(MediaStreamSource ^sender, MediaStreamSourceSampleRequestedEventArgs ^args);
+		void OnStarting(MediaStreamSource^ sender, MediaStreamSourceStartingEventArgs^ args);
+		void OnSampleRequested(MediaStreamSource^ sender, MediaStreamSourceSampleRequestedEventArgs^ args);
 		void OnSwitchStreamsRequested(MediaStreamSource^ sender, MediaStreamSourceSwitchStreamsRequestedEventArgs^ args);
-		void OnAudioTracksChanged(MediaPlaybackItem ^sender, IVectorChangedEventArgs ^args);
-		void OnPresentationModeChanged(MediaPlaybackTimedMetadataTrackList ^sender, TimedMetadataPresentationModeChangedEventArgs ^args);
+		void OnAudioTracksChanged(MediaPlaybackItem^ sender, IVectorChangedEventArgs^ args);
+		void OnPresentationModeChanged(MediaPlaybackTimedMetadataTrackList^ sender, TimedMetadataPresentationModeChangedEventArgs^ args);
 		void InitializePlaybackItem(MediaPlaybackItem^ playbackitem);
-
+		bool CheckUseHardwareAcceleration(AVCodecContext* avCodecCtx, HardwareAccelerationStatus^ status, HardwareDecoderStatus& hardwareDecoderStatus, bool manualStatus, int maxProfile, int maxLevel);
 
 	internal:
 		static FFmpegInteropMSS^ CreateFromStream(IRandomAccessStream^ stream, FFmpegInteropConfig^ config, MediaStreamSource^ mss, CoreDispatcher^ dispatcher);
@@ -264,32 +310,35 @@ namespace FFmpegInterop
 		{
 			MediaSampleProvider^ get()
 			{
-				return videoStream;
+				return currentVideoStream;
 			}
 		}
 
 		FFmpegReader^ m_pReader;
-		AVDictionary * avDict;
+		AVDictionary* avDict;
 		AVIOContext* avIOCtx;
 		AVFormatContext* avFormatCtx;
 		IStream* fileStreamData;
 		ByteOrderMark streamByteOrderMark;
-		FFmpegInteropConfig ^ config;
+		FFmpegInteropConfig^ config;
 
 	private:
 
-		MediaStreamSource ^ mss;
+		MediaStreamSource^ mss;
 		EventRegistrationToken startingRequestedToken;
 		EventRegistrationToken sampleRequestedToken;
 		EventRegistrationToken switchStreamRequestedToken;
 		MediaPlaybackItem^ playbackItem;
 		Vector<AudioStreamInfo^>^ audioStrInfos;
 		Vector<SubtitleStreamInfo^>^ subtitleStrInfos;
+		Vector<VideoStreamInfo^>^ videoStrInfos;
 
 		std::vector<MediaSampleProvider^> sampleProviders;
 		std::vector<MediaSampleProvider^> audioStreams;
 		std::vector<SubtitleProvider^> subtitleStreams;
-		MediaSampleProvider^ videoStream;
+		std::vector<MediaSampleProvider^> videoStreams;
+
+		MediaSampleProvider^ currentVideoStream;
 		MediaSampleProvider^ currentAudioStream;
 		IVectorView<AvEffectDefinition^>^ currentAudioEffects;
 		int thumbnailStreamIndex;
@@ -297,9 +346,11 @@ namespace FFmpegInterop
 		EventRegistrationToken audioTracksChangedToken;
 		EventRegistrationToken subtitlePresentationModeChangedToken;
 
-		VideoStreamInfo^ videoStreamInfo;
+
+		IVectorView<VideoStreamInfo^>^ videoStreamInfos;
 		IVectorView<AudioStreamInfo^>^ audioStreamInfos;
 		IVectorView<SubtitleStreamInfo^>^ subtitleStreamInfos;
+		IVectorView<ChapterInfo^>^ chapterInfos;
 
 		AttachedFileHelper^ attachedFileHelper;
 
@@ -315,6 +366,10 @@ namespace FFmpegInterop
 		TimeSpan subtitleDelay;
 		unsigned char* fileStreamBuffer;
 		bool isFirstSeek;
+		AVBufferRef* avHardwareContext;
+		AVBufferRef* avHardwareContextDefault;
+		ID3D11Device* device;
+		ID3D11DeviceContext* deviceContext;
 
 		static CoreDispatcher^ GetCurrentDispatcher();
 	};
